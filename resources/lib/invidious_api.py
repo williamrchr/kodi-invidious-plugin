@@ -1,6 +1,6 @@
 import time
 from collections import namedtuple
-from typing import Iterator, Union
+from typing import Iterator, Union, Optional
 
 import requests
 import xbmc
@@ -58,10 +58,10 @@ class InvidiousAPIClient:
     session: requests.Session
     addon: xbmcaddon.Addon
     authenticated: bool
-    username: str | None
-    password: str | None
+    username: Optional[str]
+    password: Optional[str]
 
-    def __init__(self, instance_url: str, auth: None | dict[str, str] = None):
+    def __init__(self, instance_url: str, auth: Optional[dict[str, str]] = None):
         self.instance_url = instance_url.rstrip("/")
         self.session = requests.Session()
         self.authenticated = False
@@ -94,7 +94,7 @@ class InvidiousAPIClient:
             self.authenticated = True
 
     def _make_get_request(
-        self, path: str, params: None | dict[str, str] = None
+        self, path: str, params: Optional[dict[str, str]] = None
     ) -> requests.Response:
         assembled_url = self.base_url + path
 
