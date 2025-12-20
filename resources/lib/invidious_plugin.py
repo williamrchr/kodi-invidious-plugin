@@ -63,13 +63,17 @@ class InvidiousPlugin:
         self.addon_handle = addon_handle
         self.addon = xbmcaddon.Addon()
         self.args = args
+        self.api_client = None
         path = xbmcvfs.translatePath(self.addon.getAddonInfo("profile"))
         self.search_history = SearchHistory(path + "search-history.json", 20)
 
         settings = self.addon.getSettings()
         self.auto_instance = settings.getBool("auto_instance")
+        self.disable_dash = settings.getBool("disable_dash")
+        self.show_instance_trending = settings.getBool("show_instance_trending")
+        self.show_instance_popular = settings.getBool("show_instance_popular")
         instance_auth = None
-        if self.auto_instance and not settings.getString("instance_url"):
+        if self.auto_instance or not settings.getString("instance_url"):
             instance_url = self.instance_autodetect()
             self.addon.setSetting("instance_url", instance_url)
         else:
@@ -79,14 +83,13 @@ class InvidiousPlugin:
                     "username": settings.getString("instance_username"),
                     "password": settings.getString("instance_password"),
                 }
+        if not instance_url:
+            return
 
         xbmc.log(f"invidous using instance {instance_url}.", xbmc.LOGINFO)
         self.api_client = invidious_api.InvidiousAPIClient(
             instance_url, auth=instance_auth
         )
-        self.disable_dash = settings.getBool("disable_dash")
-        self.show_instance_trending = settings.getBool("show_instance_trending")
-        self.show_instance_popular = settings.getBool("show_instance_popular")
 
     def instance_autodetect(self):
         xbmc.log("invidious picking instance automatically.", xbmc.LOGINFO)
@@ -98,7 +101,9 @@ class InvidiousPlugin:
                 "invidious considering instance " + str(instanceinfo), xbmc.LOGDEBUG
             )
             instancename, instance = instanceinfo
-            if "https" == instance["type"] and instance["api"] is not False:
+            if "https" == instance["type"] \
+               and instance["api"] is not False \
+               and instance["monitor"]["down_since"] is None:
                 instance_url = instance["uri"]
                 # Make sure the instance work for us.  This test avoid
                 # those rejecting us with HTTP status 429.  Some
@@ -127,7 +132,7 @@ class InvidiousPlugin:
             self.addon.getLocalizedString(30013),
             "error",
         )
-        raise ValueError("unable to find working Invidious instance")
+        return None
 
     def build_url(self, action, **kwargs):
         if not action:
@@ -349,6 +354,8 @@ class InvidiousPlugin:
         """
 
         action = self.args.get("action", [None])[0]
+        if not self.api_client:
+            return
 
         # debugging
         xbmc.log("invidous --------------------------------------------", xbmc.LOGDEBUG)
