@@ -105,12 +105,6 @@ class InvidiousPlugin:
                and instance["api"] is not False \
                and instance["monitor"]["down_since"] is None:
                 instance_url = instance["uri"]
-                # Make sure the instance work for us.  This test avoid
-                # those rejecting us with HTTP status 429.  Some
-                # instances return a sensible value for the special
-                # lists but not for an individual video, so test with
-                # a fairly randomly picked video id to avoid partly
-                # working instances.
                 test_video_id = "1l2_uCyBXQ0"
                 api_client = invidious_api.InvidiousAPIClient(instance_url)
                 try:
@@ -125,7 +119,6 @@ class InvidiousPlugin:
             "invidious no working https type instance with API support returned from api.invidious.io.",
             xbmc.LOGWARNING,
         )
-        # FIXME figure out how to show failing autodetection to the user.
         dialog = xbmcgui.Dialog()
         dialog.notification(
             self.addon.getLocalizedString(30012),
@@ -151,7 +144,6 @@ class InvidiousPlugin:
     def display_search_results(
         self, results: Iterator[invidious_api.InvidiousApiResponseType]
     ):
-        # FIXME Add pagination support?
         for result in results:
             if result.type not in ["video", "channel", "playlist"]:
                 raise RuntimeError("unknown result type " + result.type)
@@ -163,24 +155,22 @@ class InvidiousPlugin:
                 }
             )
 
-            # if this is NOT set, the plugin is called with an invalid handle when trying to play this item
-            # seriously, Kodi? come on...
-            # https://forum.kodi.tv/showthread.php?tid=173986&pid=1519987#pid1519987
             list_item.setProperty("IsPlayable", "true")
             if isinstance(result, invidious_api.VideoSearchResult):
                 datestr = datetime.utcfromtimestamp(result.published).date().isoformat()
 
                 info_tag = ListItemInfoTag(list_item, "video")
+                # KODI 21 FIX: credits as list, duration as int
                 info_tag.set_info(
                     {
                         "title": result.heading,
                         "mediatype": "video",
                         "plot": result.description,
-                        "credits": result.author,
+                        "credits": [result.author],
                         "date": datestr,
                         "dateadded": datestr,
                         "premiered": datestr,
-                        "duration": result.duration,
+                        "duration": int(result.duration),
                     }
                 )
 
@@ -203,7 +193,6 @@ class InvidiousPlugin:
         self.end_of_directory()
 
     def display_new_search(self):
-        # query search with a dialog
         dialog = xbmcgui.Dialog()
         search_input = dialog.input(
             self.addon.getLocalizedString(30001), type=xbmcgui.INPUT_ALPHANUM
@@ -219,10 +208,8 @@ class InvidiousPlugin:
 
         xbmc.log(f"invidious searching for {search_input}.", xbmc.LOGDEBUG)
 
-        # pass search query to Invidious
         results = self.api_client.search(search_input)
 
-        # assemble menu with the results
         self.display_search_results(results)
 
     def display_channel_list(self, channel_id):
@@ -236,13 +223,65 @@ class InvidiousPlugin:
         self.display_search_results(videos)
 
     def play_video(self, id):
-        # TODO: add support for adaptive streaming
+        # 1. Fetch video info with local=true
+        video_info = self.api_client.fetch_video_information(id)
+
+        listitem = None
+        if not self.disable_dash and "dashUrl" in video_info:
+            is_helper = inputstreamhelper.Helper("mpd")
+            if is_helper.check_inputstream():
+                dash_url = video_info["dashUrl"]
+                
+                # Ensure the DASH URL points to your instance and has local=true
+                if not dash_url.startswith("http"):
+                    dash_url = self.api_client.instance_url + dash_url
+                
+                if "local=true" not in dash_url:
+                    separator = "&" if "?" in dash_url else "?"
+                    dash_url += f"{separator}local=true"
+
+                # Use the Pipe symbol to pass a User-Agent directly to Kodi's cURL
+                # This is the most reliable way to stop 302 redirects
+                final_url = dash_url + "|User-Agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                
+                listitem = xbmcgui.ListItem(path=final_url)
+                listitem.setProperty("inputstream", "inputstream.adaptive")
+                listitem.setProperty("inputstream.adaptive.manifest_type", "mpd")
+                
+                # Tell ISA to keep using this User-Agent for all video segments
+                listitem.setProperty("inputstream.adaptive.stream_headers", "User-Agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                
+                # Kodi 21 strict MIME type
+                listitem.setMimeType('application/dash+xml')
+
+        # Fallback to single-stream if DASH fails
+        if listitem is None:
+            url = video_info["formatStreams"][-1]["url"]
+            listitem = xbmcgui.ListItem(path=url)
+
+        # Apply the Metadata (Kodi 21 Fixes)
+        datestr = datetime.utcfromtimestamp(video_info["published"]).date().isoformat()
+        info_tag = ListItemInfoTag(listitem, "video")
+        info_tag.set_info({
+            "title": video_info["title"],
+            "mediatype": "video",
+            "plot": video_info["description"],
+            "credits": [video_info["author"]], # Must be a list
+            "date": datestr,
+            "duration": int(video_info["lengthSeconds"]), # Must be an int
+        })
+
+        if self.addon_handle > -1:
+            xbmcplugin.setResolvedUrl(self.addon_handle, succeeded=True, listitem=listitem)
+        else:
+            xbmc.Player().play(final_url if listitem else url, listitem)
+
+    def play_video_old(self, id):
         video_info = self.api_client.fetch_video_information(id)
 
         xbmc.log(f"invidious playing video {video_info}.", xbmc.LOGDEBUG)
 
         listitem = None
-        # check if playback via MPEG-DASH is possible
         if not self.disable_dash and "dashUrl" in video_info:
             is_helper = inputstreamhelper.Helper("mpd")
 
@@ -257,29 +296,27 @@ class InvidiousPlugin:
                     "invidious mpeg-dash input helper not available.", xbmc.LOGDEBUG
                 )
 
-        # as a fallback, we use the last oldschool stream, as it is
-        # often the best quality.
         if listitem is None:
             url = video_info["formatStreams"][-1]["url"]
             xbmc.log(
                 f"invidious playback failing back to non-dash stream {url}!",
                 xbmc.LOGINFO,
             )
-            # it's pretty complicated to play a video by its URL in Kodi...
             listitem = xbmcgui.ListItem(path=url)
 
         datestr = datetime.utcfromtimestamp(video_info["published"]).date().isoformat()
         info_tag = ListItemInfoTag(listitem, "video")
+        # KODI 21 FIX: credits as list, duration as int
         info_tag.set_info(
             {
                 "title": video_info["title"],
                 "mediatype": "video",
                 "plot": video_info["description"],
-                "credits": video_info["author"],
+                "credits": [video_info["author"]],
                 "date": datestr,
                 "dateadded": datestr,
                 "premiered": datestr,
-                "duration": str(video_info["lengthSeconds"]),
+                "duration": int(video_info["lengthSeconds"]),
             }
         )
 
@@ -288,10 +325,7 @@ class InvidiousPlugin:
                 self.api_client.mark_watched(id)
             except Exception as e:
                 xbmc.log(f"invidious: Failed to mark item watched: {e}", xbmc.LOGERROR)
-                # TODO: logging, alerting, moving on.
 
-        # basilgello: calling 'RunPlugin' via kodi-send results in CScriptRunner::ExecuteScript
-        # which in turn sets addon_handle to -1 breaking the playback
         if self.addon_handle > -1:
             xbmcplugin.setResolvedUrl(
                 self.addon_handle, succeeded=True, listitem=listitem
@@ -309,7 +343,6 @@ class InvidiousPlugin:
                 url=self.build_url(path), listitem=listitem, isFolder=True
             )
 
-        # video search item
         add_list_item(self.addon.getLocalizedString(30001), "search_menu")
 
         if self.api_client.username:
@@ -334,7 +367,6 @@ class InvidiousPlugin:
                 url=self.build_url(path), listitem=listitem, isFolder=True
             )
 
-        # New search on top.
         add_list_item(self.addon.getLocalizedString(30002), "new_search")
 
         for query in self.search_history.queries():
@@ -348,24 +380,10 @@ class InvidiousPlugin:
         self.end_of_directory()
 
     def run(self):
-        """
-        Web application style method dispatching.
-        Uses querystring only, which is pretty oldschool CGI-like stuff.
-        """
-
         action = self.args.get("action", [None])[0]
         if not self.api_client:
             return
 
-        # debugging
-        xbmc.log("invidous --------------------------------------------", xbmc.LOGDEBUG)
-        xbmc.log("invidous base url:" + str(self.base_url), xbmc.LOGDEBUG)
-        xbmc.log("invidous handle:" + str(self.addon_handle), xbmc.LOGDEBUG)
-        xbmc.log("invidous args:" + str(self.args), xbmc.LOGDEBUG)
-        xbmc.log("invidous action:" + str(action), xbmc.LOGDEBUG)
-        xbmc.log("invidous --------------------------------------------", xbmc.LOGDEBUG)
-
-        # for the sake of simplicity, we just handle HTTP request errors here centrally
         try:
             if not action:
                 self.display_main_menu()
